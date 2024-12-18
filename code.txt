@@ -1,0 +1,357 @@
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <cmath>
+#include <algorithm>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <windows.h> // 使用 Windows API
+#include <vector>
+#include <string>
+#include <map>
+#include <regex> // 新增正则表达式库
+#include <Eigen/Dense>  // Eigen 库
+#include <Eigen/Sparse>
+#include <thread> // 多线程库
+#include <mutex>  // 互斥锁
+#include <chrono> // 用于高精度时间测量
+
+using namespace std;
+using namespace Eigen;
+using namespace chrono;
+
+// 定义 RQA 分析结果结构体
+struct RQAMetrics {
+    double recurrence_rate;
+    double mean_diag_length;
+    double max_diag_length;
+    double mean_vertical_length;
+    double max_vertical_length;
+};
+
+// 辅助函数：将 std::string 转换为 std::wstring
+wstring stringToWString(const string& str) {
+    int size_needed = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), NULL, 0);
+    wstring wstrTo(size_needed, 0);
+    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), &wstrTo[0], size_needed);
+    return wstrTo;
+}
+
+// 创建目录
+void createDirectory(const string& path) {
+    wstring wpath = stringToWString(path);
+    if (CreateDirectory(wpath.c_str(), NULL) || GetLastError() == ERROR_ALREADY_EXISTS) {
+        // 创建成功或目录已存在
+    }
+    else {
+        cerr << "无法创建目录: " << path << endl;
+    }
+}
+
+// 获取目录中的文件列表
+vector<string> getFilesInDirectory(const string& dir) {
+    vector<string> files;
+    wstring wdir = stringToWString(dir + "\\*");
+    WIN32_FIND_DATAW findFileData;
+    HANDLE hFind = FindFirstFileW(wdir.c_str(), &findFileData);
+
+    if (hFind == INVALID_HANDLE_VALUE) {
+        cerr << "无法打开目录: " << dir << endl;
+        return files;
+    }
+
+    do {
+        if (!(findFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            wstring wfilename(findFileData.cFileName);
+            files.push_back(dir + "\\" + string(wfilename.begin(), wfilename.end()));
+        }
+    } while (FindNextFileW(hFind, &findFileData) != 0);
+
+    FindClose(hFind);
+    return files;
+}
+
+// 读取数据文件
+VectorXd readData(const string& file_path) {
+    ifstream file(file_path);
+    if (!file.is_open()) {
+        cerr << "无法打开文件: " << file_path << endl;
+        return VectorXd();
+    }
+
+    vector<double> data;
+    string line;
+    bool header_skipped = false;
+
+    while (getline(file, line)) {
+        // 跳过文件的头部
+        if (!header_skipped) {
+            header_skipped = true;
+            continue; // 跳过第一行（标题）
+        }
+
+        stringstream ss(line);
+        string date;
+        double open, high, low, close, volume, amount;
+
+        // 读取一行数据，尝试解析
+        if (ss >> date >> open >> high >> low >> close >> volume >> amount) {
+            // 将解析成功的数据添加到列表中
+            data.push_back(open);
+            data.push_back(high);
+            data.push_back(low);
+            data.push_back(close);
+            data.push_back(volume);
+            data.push_back(amount);
+        }
+        else {
+            cerr << "数据解析错误，跳过行: " << line << endl;
+        }
+    }
+
+    // 检查是否成功读取数据
+    if (data.empty()) {
+        cerr << "文件: " << file_path << " 中没有有效数据，跳过该文件" << endl;
+        return VectorXd();
+    }
+
+    VectorXd vec(data.size());
+    for (size_t i = 0; i < data.size(); ++i) {
+        vec(static_cast<long>(i)) = data[i];
+    }
+    return vec;
+}
+
+// 写入数据到文件
+void writeData(const string& file_path, const map<string, double>& data) {
+    ofstream file(file_path);
+    if (!file.is_open()) {
+        cerr << "无法打开文件: " << file_path << endl;
+        return;
+    }
+
+    for (map<string, double>::const_iterator it = data.begin(); it != data.end(); ++it) {
+        file << it->first << ": " << it->second << endl;
+    }
+}
+
+// 计算最佳嵌入维度
+int calculateFNN(const VectorXd& data, int delay, int max_dim = 10) {
+    cout << "嵌入维度计算结果: " << max_dim << endl;
+    return max_dim; // 示例实现，实际可优化
+}
+
+// 计算最佳延迟时间
+int calculateDelayTime(const VectorXd& data, int max_delay = 30) {
+    vector<double> autocorrelations;
+    for (int tau = 1; tau <= max_delay; ++tau) {
+        VectorXd x = data.head(data.size() - tau);
+        VectorXd y = data.tail(data.size() - tau);
+        double corr = (x.array() * y.array()).mean();
+        autocorrelations.push_back(corr);
+    }
+    auto it = min_element(autocorrelations.begin(), autocorrelations.end());
+    int delay_time = static_cast<int>(distance(autocorrelations.begin(), it)) + 1;
+
+    // 添加调试输出
+    cout << "延迟时间计算结果: " << delay_time << endl;
+
+    return delay_time;
+}
+
+// 计算递归矩阵
+MatrixXd calculateRP(const VectorXd& data, int embedding_dim, int delay_time, double threshold = -1) {
+    int N = data.size() - (embedding_dim - 1) * delay_time;
+    if (N <= 0) {
+        cerr << "数据长度不足以进行嵌入，跳过文件。" << endl;
+        return MatrixXd();
+    }
+    MatrixXd embedded(embedding_dim, N);
+    for (int i = 0; i < N; ++i) {
+        for (int j = 0; j < embedding_dim; ++j) {
+            embedded(j, i) = data(i + j * delay_time);
+        }
+    }
+
+    MatrixXd distances(N, N);
+    for (int i = 0; i < N; ++i) {
+        for (int j = 0; j < N; ++j) {
+            distances(i, j) = (embedded.col(i) - embedded.col(j)).norm();
+        }
+    }
+
+    if (threshold < 0) {
+        threshold = distances.mean();
+    }
+
+    // 添加调试输出
+    cout << "嵌入矩阵大小: " << embedded.rows() << "x" << embedded.cols() << endl;
+    cout << "距离矩阵阈值: " << threshold << endl;
+
+    return (distances.array() <= threshold).cast<double>();
+}
+
+// RQA 分析
+RQAMetrics rqaAnalysis(const MatrixXd& rp) {
+    double rr = rp.sum() / (rp.rows() * rp.cols());
+    double mean_diag_length = 0.0;
+    double max_diag_length = 0.0;
+    double mean_vertical_length = 0.0;
+    double max_vertical_length = 0.0;
+    int diag_count = 0;
+    int vert_count = 0;
+
+    // 计算对角线长度
+    for (int k = -rp.rows() + 1; k < rp.cols(); ++k) {
+        VectorXd diag = rp.diagonal(k);
+        int current_length = 0;
+        for (int i = 0; i < diag.size(); ++i) {
+            if (diag(i) == 1) {
+                current_length++;
+            }
+            else if (current_length > 0) {
+                mean_diag_length += current_length;
+                max_diag_length = max(max_diag_length, (double)current_length);
+                diag_count++;
+                current_length = 0;
+            }
+        }
+        if (current_length > 0) {
+            mean_diag_length += current_length;
+            max_diag_length = max(max_diag_length, (double)current_length);
+            diag_count++;
+        }
+    }
+    if (diag_count > 0) {
+        mean_diag_length /= diag_count;
+    }
+
+    // 计算垂直线长度
+    for (int j = 0; j < rp.cols(); ++j) {
+        int current_length = 0;
+        for (int i = 0; i < rp.rows(); ++i) {
+            if (rp(i, j) == 1) {
+                current_length++;
+            }
+            else if (current_length > 0) {
+                mean_vertical_length += current_length;
+                max_vertical_length = max(max_vertical_length, (double)current_length);
+                vert_count++;
+                current_length = 0;
+            }
+        }
+        if (current_length > 0) {
+            mean_vertical_length += current_length;
+            max_vertical_length = max(max_vertical_length, (double)current_length);
+            vert_count++;
+        }
+    }
+    if (vert_count > 0) {
+        mean_vertical_length /= vert_count;
+    }
+
+    return { rr, mean_diag_length, max_diag_length, mean_vertical_length, max_vertical_length };
+}
+
+void processFile(const string& file, const string& output_dir, mutex& io_mutex) {
+    // 记录开始时间
+    auto start_time = high_resolution_clock::now();
+
+    // 读取数据文件
+    VectorXd data = readData(file);
+    if (data.size() == 0) {
+        lock_guard<mutex> lock(io_mutex);
+        cerr << "文件: " << file << " 的数据读取失败，跳过该文件" << endl;
+        return;
+    }
+
+    // 打印调试信息，确保数据正常读取
+    {
+        lock_guard<mutex> lock(io_mutex);
+        cout << "读取文件: " << file << "，数据点数: " << data.size() << endl;
+    }
+
+    // 计算延迟时间
+    auto delay_start = high_resolution_clock::now();
+    int delay_time = calculateDelayTime(data);
+    auto delay_end = high_resolution_clock::now();
+    cout << "延迟时间计算耗时: " << duration_cast<milliseconds>(delay_end - delay_start).count() << " ms" << endl;
+
+    // 计算嵌入维度
+    auto embedding_start = high_resolution_clock::now();
+    int embedding_dim = calculateFNN(data, delay_time);
+    auto embedding_end = high_resolution_clock::now();
+    cout << "嵌入维度计算耗时: " << duration_cast<milliseconds>(embedding_end - embedding_start).count() << " ms" << endl;
+
+    // 计算递归图
+    auto rp_start = high_resolution_clock::now();
+    MatrixXd rp = calculateRP(data, embedding_dim, delay_time);
+    auto rp_end = high_resolution_clock::now();
+    cout << "递归矩阵计算耗时: " << duration_cast<milliseconds>(rp_end - rp_start).count() << " ms" << endl;
+
+    if (rp.size() == 0) {
+        lock_guard<mutex> lock(io_mutex);
+        cerr << "无法计算递归图，跳过文件: " << file << endl;
+        return;
+    }
+
+    // 执行 RQA 分析
+    auto rqa_start = high_resolution_clock::now();
+    RQAMetrics metrics = rqaAnalysis(rp);
+    auto rqa_end = high_resolution_clock::now();
+    cout << "RQA 分析耗时: " << duration_cast<milliseconds>(rqa_end - rqa_start).count() << " ms" << endl;
+
+    // 输出结果
+    {
+        lock_guard<mutex> lock(io_mutex);
+        cout << "文件: " << file << endl;
+        cout << "延迟时间: " << delay_time << endl;
+        cout << "嵌入维度: " << embedding_dim << endl;
+        cout << "递归率 (RR): " << metrics.recurrence_rate << endl;
+        cout << "平均对角线长度: " << metrics.mean_diag_length << endl;
+        cout << "最大对角线长度: " << metrics.max_diag_length << endl;
+        cout << "平均垂直线长度: " << metrics.mean_vertical_length << endl;
+        cout << "最大垂直线长度: " << metrics.max_vertical_length << endl;
+    }
+
+    // 将结果写入输出文件
+    string output_file = output_dir + "\\" + file.substr(file.find_last_of("\\") + 1) + "_rqa_results.txt";
+    map<string, double> output_data = {
+        {"recurrence_rate", metrics.recurrence_rate},
+        {"mean_diag_length", metrics.mean_diag_length},
+        {"max_diag_length", metrics.max_diag_length},
+        {"mean_vertical_length", metrics.mean_vertical_length},
+        {"max_vertical_length", metrics.max_vertical_length}
+    };
+    writeData(output_file, output_data);
+
+    // 记录结束时间并计算总耗时
+    auto end_time = high_resolution_clock::now();
+    cout << "文件: " << file << " 的总处理时间: " << duration_cast<milliseconds>(end_time - start_time).count() << " ms" << endl;
+}
+
+int main() {
+    string data_dir = "input_data"; // 输入数据文件夹
+    string output_dir = "output_data"; // 输出文件夹
+
+    // 创建输出目录
+    createDirectory(output_dir);
+
+    // 获取输入目录中的文件列表
+    vector<string> files = getFilesInDirectory(data_dir);
+
+    vector<thread> threads;
+    mutex io_mutex;
+
+    for (const auto& file : files) {
+        threads.emplace_back(processFile, file, output_dir, ref(io_mutex));
+    }
+
+    for (auto& th : threads) {
+        if (th.joinable()) {
+            th.join();
+        }
+    }
+
+    return 0;
+}
